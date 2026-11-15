@@ -246,6 +246,16 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
                 tri!(self.parser.parse_literal("alse"));
                 visitor.visit_bool(false)
             }
+            // `deserialize_any` with `use_rawnumber` keeps the number's text: a one-entry map
+            // whose key is the number token (borrowed, so its address survives buffering)
+            #[cfg(feature = "arbitrary_precision")]
+            c @ b'-' | c @ b'0'..=b'9' if self.parser.cfg.use_rawnumber => {
+                let lexeme = tri!(self.parser.skip_number(c));
+                visitor.visit_map(NumberMapAccess {
+                    lexeme,
+                    key_done: false,
+                })
+            }
             c @ b'-' | c @ b'0'..=b'9' => visit_number(&tri!(self.parser.parse_number(c)), visitor),
             b'"' => match tri!(self.parser.parse_str(&mut self.scratch)) {
                 Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
@@ -265,6 +275,46 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
         let result = f(self);
         self.parser.leave_nested();
         result
+    }
+}
+
+/// A raw number as `deserialize_any` hands it: a one-entry map from [`crate::NUMBER_TOKEN`]
+/// (borrowed, so its address survives buffering) to the number's text.
+#[cfg(feature = "arbitrary_precision")]
+struct NumberMapAccess<'de> {
+    lexeme: &'de str,
+    key_done: bool,
+}
+
+#[cfg(feature = "arbitrary_precision")]
+impl<'de> de::MapAccess<'de> for NumberMapAccess<'de> {
+    type Error = Error;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>>
+    where
+        K: de::DeserializeSeed<'de>,
+    {
+        if self.key_done {
+            return Ok(None);
+        }
+        self.key_done = true;
+        seed.deserialize(de::value::BorrowedStrDeserializer::<Error>::new(
+            crate::serde::rawnumber::NUMBER_TOKEN,
+        ))
+        .map(Some)
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value>
+    where
+        V: de::DeserializeSeed<'de>,
+    {
+        seed.deserialize(de::value::BorrowedStrDeserializer::<Error>::new(
+            self.lexeme,
+        ))
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(usize::from(!self.key_done))
     }
 }
 
@@ -457,7 +507,7 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
         unsafe {
             let binary =
                 &*slice_from_raw_parts(&val as *const _ as *const u8, std::mem::size_of::<Value>());
-            visitor.visit_bytes(binary)
+            crate::value::de::hand_off(binary, visitor)
         }
     }
 

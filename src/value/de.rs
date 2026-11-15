@@ -1,4 +1,4 @@
-use std::{mem::MaybeUninit, result::Result as StdResult, slice};
+use std::{cell::Cell, mem::MaybeUninit, result::Result as StdResult, slice};
 
 use ::serde::{
     de::{
@@ -81,6 +81,26 @@ impl<'de> Deserialize<'de> for Value {
 
 pub(crate) const TOKEN: &str = "$sonic_rs::private::Value";
 
+thread_local! {
+    /// The address of the bytes sonic-rs is handing to `ValueVisitor::visit_bytes` right now, or
+    /// null. Foreign callers cannot know it, so a foreign byte string is never taken as a `Value`.
+    static HAND_OFF: Cell<*const u8> = const { Cell::new(std::ptr::null()) };
+}
+
+/// Passes a ready `Value`, as its bytes, to a visitor (the private hand-off to `ValueVisitor`).
+///
+/// # Safety
+/// `binary` must be the bytes of a live `Value` whose ownership the visitor takes.
+pub(crate) unsafe fn hand_off<'de, V>(binary: &[u8], visitor: V) -> Result<V::Value, Error>
+where
+    V: Visitor<'de>,
+{
+    HAND_OFF.with(|slot| slot.set(binary.as_ptr()));
+    let ret = visitor.visit_bytes(binary);
+    HAND_OFF.with(|slot| slot.set(std::ptr::null()));
+    ret
+}
+
 pub(crate) struct ValueVisitor;
 
 impl<'de> Visitor<'de> for ValueVisitor {
@@ -94,13 +114,19 @@ impl<'de> Visitor<'de> for ValueVisitor {
     where
         E: de::Error,
     {
+        // Only sonic-rs's own hand-off (`hand_off`) may pass a ready `Value` as bytes. Any other
+        // deserializer can call `visit_bytes` too (a byte string forwarded from
+        // `deserialize_newtype_struct` to `deserialize_any`), and its bytes must never be taken
+        // as a `Value`.
+        let expected = HAND_OFF.with(|slot| slot.replace(std::ptr::null()));
+        if expected.is_null()
+            || !std::ptr::eq(expected, value_binary.as_ptr())
+            || value_binary.len() != std::mem::size_of::<Value>()
+        {
+            return Err(E::custom("bytes are not a JSON value"));
+        }
         // we pass the value from value_binary
         unsafe {
-            assert!(
-                value_binary.len() == std::mem::size_of::<Value>(),
-                "invalid value size {}",
-                value_binary.len()
-            );
             let mut dom: MaybeUninit<Value> = MaybeUninit::zeroed();
             std::ptr::copy_nonoverlapping(
                 value_binary.as_ptr() as *const Value,
@@ -117,6 +143,95 @@ impl<'de> Visitor<'de> for ValueVisitor {
         D: de::Deserializer<'de>,
     {
         deserializer.deserialize_any(ValueBuilder)
+    }
+
+    // Many deserializers (`serde::de::value::*`, buffered content) forward
+    // `deserialize_newtype_struct` to `deserialize_any`, so the entry visitor sees the parts
+    // directly: build the value from them, as `ValueBuilder` does. `visit_bytes` is not among
+    // them: it is the private hand-off above, and a foreign byte string is refused there.
+
+    fn visit_bool<E>(self, v: bool) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_bool(v)
+    }
+
+    fn visit_i64<E>(self, v: i64) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_i64(v)
+    }
+
+    fn visit_u64<E>(self, v: u64) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_u64(v)
+    }
+
+    fn visit_i128<E>(self, v: i128) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_i128(v)
+    }
+
+    fn visit_u128<E>(self, v: u128) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_u128(v)
+    }
+
+    fn visit_f64<E>(self, v: f64) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_f64(v)
+    }
+
+    fn visit_str<E>(self, v: &str) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_str(v)
+    }
+
+    fn visit_unit<E>(self) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_unit()
+    }
+
+    fn visit_none<E>(self) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_none()
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> StdResult<Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        ValueBuilder.visit_some(deserializer)
+    }
+
+    fn visit_seq<A>(self, seq: A) -> StdResult<Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        ValueBuilder.visit_seq(seq)
+    }
+
+    fn visit_map<A>(self, map: A) -> StdResult<Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        ValueBuilder.visit_map(map)
     }
 }
 
@@ -155,8 +270,30 @@ impl<'de> Visitor<'de> for ValueBuilder {
     }
 
     /// A non-finite float has no JSON form and becomes `null`, as in `serde_json::Value`.
+    #[cfg(not(feature = "arbitrary_precision"))]
     fn visit_f64<E>(self, v: f64) -> StdResult<Value, E> {
         Ok(Value::new_f64(v).unwrap_or_default())
+    }
+
+    /// With `arbitrary_precision` a non-finite float is refused instead: turning it into `null`
+    /// would silently change the document.
+    #[cfg(feature = "arbitrary_precision")]
+    fn visit_f64<E>(self, v: f64) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        Value::new_f64(v).ok_or_else(|| E::custom("a non-finite float is not a JSON number"))
+    }
+
+    /// With `arbitrary_precision`, a 128-bit integer is kept exactly, as a raw number.
+    #[cfg(feature = "arbitrary_precision")]
+    fn visit_i128<E>(self, v: i128) -> StdResult<Value, E> {
+        Ok(Value::new_rawnum(&v.to_string()))
+    }
+
+    #[cfg(feature = "arbitrary_precision")]
+    fn visit_u128<E>(self, v: u128) -> StdResult<Value, E> {
+        Ok(Value::new_rawnum(&v.to_string()))
     }
 
     fn visit_str<E>(self, v: &str) -> StdResult<Value, E> {
@@ -196,6 +333,7 @@ impl<'de> Visitor<'de> for ValueBuilder {
         Ok(array.into_value())
     }
 
+    #[cfg(not(feature = "arbitrary_precision"))]
     fn visit_map<A>(self, mut map: A) -> StdResult<Value, A::Error>
     where
         A: MapAccess<'de>,
@@ -207,6 +345,157 @@ impl<'de> Visitor<'de> for ValueBuilder {
         }
         Ok(object.into_value())
     }
+
+    /// With `arbitrary_precision`, a one-entry map whose key is sonic-rs's own number token (see
+    /// [`crate::is_number_token`]) is a raw number, as handed out by `deserialize_any`. A key
+    /// merely spelled like the token (a YAML or document key, an owned string) is an ordinary key.
+    #[cfg(feature = "arbitrary_precision")]
+    fn visit_map<A>(self, mut map: A) -> StdResult<Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = Object::with_capacity(map.size_hint().unwrap_or(0));
+        let mut next = match map.next_key_seed(FirstKeySeed)? {
+            None => return Ok(object.into_value()),
+            Some(FirstKey::Number) => {
+                let lexeme = map.next_value_seed(LexemeSeed)?;
+                if map.next_key::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom("a number holds exactly one entry"));
+                }
+                return Ok(Value::new_rawnum(&lexeme));
+            }
+            Some(FirstKey::Text(key)) => Some(key),
+        };
+        while let Some(key) = next {
+            let value = map.next_value_seed(ValueBuilder)?;
+            object.insert(&key, value);
+            next = map.next_key::<String>()?;
+        }
+        Ok(object.into_value())
+    }
+}
+
+/// The first key of a map being built: sonic-rs's own number token, or text.
+#[cfg(feature = "arbitrary_precision")]
+enum FirstKey {
+    Number,
+    Text(String),
+}
+
+#[cfg(feature = "arbitrary_precision")]
+struct FirstKeySeed;
+
+#[cfg(feature = "arbitrary_precision")]
+impl<'de> DeserializeSeed<'de> for FirstKeySeed {
+    type Value = FirstKey;
+
+    fn deserialize<D>(self, deserializer: D) -> StdResult<FirstKey, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_string(self)
+    }
+}
+
+#[cfg(feature = "arbitrary_precision")]
+impl<'de> Visitor<'de> for FirstKeySeed {
+    type Value = FirstKey;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a string key")
+    }
+
+    /// The token is recognised by address, only here: a borrowed key that is the very
+    /// `NUMBER_TOKEN` static came from sonic-rs itself.
+    fn visit_borrowed_str<E>(self, v: &'de str) -> StdResult<FirstKey, E> {
+        if crate::serde::rawnumber::is_number_token(v) {
+            Ok(FirstKey::Number)
+        } else {
+            Ok(FirstKey::Text(v.to_owned()))
+        }
+    }
+
+    fn visit_str<E>(self, v: &str) -> StdResult<FirstKey, E> {
+        Ok(FirstKey::Text(v.to_owned()))
+    }
+
+    fn visit_string<E>(self, v: String) -> StdResult<FirstKey, E> {
+        Ok(FirstKey::Text(v))
+    }
+}
+
+/// The text of a number entry: it must be a JSON number.
+#[cfg(feature = "arbitrary_precision")]
+struct LexemeSeed;
+
+#[cfg(feature = "arbitrary_precision")]
+impl<'de> DeserializeSeed<'de> for LexemeSeed {
+    type Value = String;
+
+    fn deserialize<D>(self, deserializer: D) -> StdResult<String, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_str(self)
+    }
+}
+
+#[cfg(feature = "arbitrary_precision")]
+impl<'de> Visitor<'de> for LexemeSeed {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON number")
+    }
+
+    fn visit_str<E>(self, v: &str) -> StdResult<String, E>
+    where
+        E: de::Error,
+    {
+        if is_json_number(v) {
+            Ok(v.to_owned())
+        } else {
+            Err(E::custom("not a valid JSON number"))
+        }
+    }
+}
+
+/// Whether `s` is a JSON number: `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`.
+#[cfg(feature = "arbitrary_precision")]
+fn is_json_number(s: &str) -> bool {
+    let b = s.as_bytes();
+    let digits = |mut i: usize| {
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        (i, i > start)
+    };
+    let mut i = usize::from(b.first() == Some(&b'-'));
+    match b.get(i) {
+        Some(b'0') => i += 1,
+        Some(b'1'..=b'9') => i = digits(i).0,
+        _ => return false,
+    }
+    if b.get(i) == Some(&b'.') {
+        let (end, any) = digits(i + 1);
+        if !any {
+            return false;
+        }
+        i = end;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let (end, any) = digits(i);
+        if !any {
+            return false;
+        }
+        i = end;
+    }
+    i == b.len()
 }
 
 struct SeqRefDeserializer<'de> {
@@ -688,7 +977,7 @@ impl<'de> serde::Deserializer<'de> for &'de Value {
                     &*val as *const Value as *const u8,
                     std::mem::size_of::<Value>(),
                 );
-                visitor.visit_bytes(binary)
+                hand_off(binary, visitor)
             };
         }
         visitor.visit_newtype_struct(self)

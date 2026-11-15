@@ -125,6 +125,9 @@ fn typed_values_return_a_depth_error_on_the_normal_stack() {
             let before = serde_json::from_str::<serde_json::Value>(&frame);
             let after = json::from_str::<serde_json::Value>(&frame);
             assert_eq!(before.is_ok(), after.is_ok(), "depth: {depth}");
+            // with `arbitrary_precision`, a number read through `deserialize_any` is the number
+            // token map (its text is kept), so only success is comparable
+            #[cfg(not(feature = "arbitrary_precision"))]
             if let (Ok(before), Ok(after)) = (before, after) {
                 assert_eq!(before, after);
             }

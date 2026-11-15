@@ -18,6 +18,9 @@ pub use self::{
     },
 };
 
+#[cfg(feature = "arbitrary_precision")]
+pub use self::rawnumber::{is_number_token, NUMBER_TOKEN};
+
 #[cfg(test)]
 #[allow(clippy::mutable_key_type)]
 mod test {
