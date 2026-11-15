@@ -6,6 +6,8 @@ pub(crate) mod rawnumber;
 pub(crate) mod ser;
 
 pub(crate) use self::de::tri;
+#[cfg(feature = "arbitrary_precision")]
+pub use self::rawnumber::{is_number_token, NUMBER_TOKEN};
 pub use self::{
     de::{
         from_reader, from_slice, from_slice_unchecked, from_str, Deserializer, StreamDeserializer,
@@ -17,9 +19,6 @@ pub use self::{
         to_writer_pretty, Serializer,
     },
 };
-
-#[cfg(feature = "arbitrary_precision")]
-pub use self::rawnumber::{is_number_token, NUMBER_TOKEN};
 
 #[cfg(test)]
 #[allow(clippy::mutable_key_type)]

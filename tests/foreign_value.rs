@@ -35,10 +35,12 @@ fn tagged_untagged_flatten_value_keeps_lexeme() {
     let input = format!(r#"{{"id":7,{numbers}}}"#);
     let parsed: Flattened = sonic_rs::from_str(&input).unwrap();
     assert_eq!(parsed.id, 7);
-    assert_eq!(
-        sonic_rs::to_string(&parsed.rest).unwrap(),
-        format!("{{{numbers}}}")
-    );
+    // the order of the members is the input's, or sorted with `sort_keys`: check each
+    let out = sonic_rs::to_string(&parsed.rest).unwrap();
+    for member in numbers.split(',') {
+        assert!(out.contains(member), "{member} in {out}");
+    }
+    assert_eq!(out.len(), numbers.len() + 2);
 }
 
 /// A key merely spelled like the number token is an ordinary key.
