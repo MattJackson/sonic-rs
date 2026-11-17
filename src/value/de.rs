@@ -1,4 +1,4 @@
-use std::{mem::MaybeUninit, result::Result as StdResult, slice};
+use std::{result::Result as StdResult, slice};
 
 use ::serde::{
     de::{
@@ -13,6 +13,7 @@ use crate::{
     error::{Error, ErrorCode},
     reader::Reader,
     serde::{number::N, tri},
+    util::hand_off,
     value::{node::Value, Array, Object},
 };
 
@@ -90,25 +91,13 @@ impl<'de> Visitor<'de> for ValueVisitor {
         formatter.write_str("a valid json")
     }
 
-    fn visit_bytes<E>(self, value_binary: &[u8]) -> StdResult<Value, E>
+    /// sonic-rs's own deserializers hand over the value they built (see `util::hand_off`). Any
+    /// other byte string is not a JSON value.
+    fn visit_bytes<E>(self, v: &[u8]) -> StdResult<Value, E>
     where
         E: de::Error,
     {
-        // we pass the value from value_binary
-        unsafe {
-            assert!(
-                value_binary.len() == std::mem::size_of::<Value>(),
-                "invalid value size {}",
-                value_binary.len()
-            );
-            let mut dom: MaybeUninit<Value> = MaybeUninit::zeroed();
-            std::ptr::copy_nonoverlapping(
-                value_binary.as_ptr() as *const Value,
-                dom.as_mut_ptr(),
-                1,
-            );
-            Ok(dom.assume_init())
-        }
+        hand_off::take(v).ok_or_else(|| E::invalid_type(Unexpected::Bytes(v), &self))
     }
 
     /// Any deserializer other than sonic-rs's own: build the value from its parts.
@@ -117,6 +106,81 @@ impl<'de> Visitor<'de> for ValueVisitor {
         D: de::Deserializer<'de>,
     {
         deserializer.deserialize_any(ValueBuilder)
+    }
+
+    // Many deserializers (serde's `de::value::*`, `IntoDeserializer`, `MapAccessDeserializer`)
+    // forward `deserialize_newtype_struct` to `deserialize_any`, so this visitor sees the parts
+    // of the value directly: build it from them, as `ValueBuilder` does. `visit_bytes` is not
+    // forwarded: it is the hand-off above.
+
+    fn visit_bool<E>(self, v: bool) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_bool(v)
+    }
+
+    fn visit_i64<E>(self, v: i64) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_i64(v)
+    }
+
+    fn visit_u64<E>(self, v: u64) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_u64(v)
+    }
+
+    fn visit_f64<E>(self, v: f64) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_f64(v)
+    }
+
+    fn visit_str<E>(self, v: &str) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_str(v)
+    }
+
+    fn visit_unit<E>(self) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_unit()
+    }
+
+    fn visit_none<E>(self) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_none()
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> StdResult<Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        ValueBuilder.visit_some(deserializer)
+    }
+
+    fn visit_seq<A>(self, seq: A) -> StdResult<Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        ValueBuilder.visit_seq(seq)
+    }
+
+    fn visit_map<A>(self, map: A) -> StdResult<Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        ValueBuilder.visit_map(map)
     }
 }
 
@@ -679,17 +743,7 @@ impl<'de> serde::Deserializer<'de> for &'de Value {
         if name == TOKEN {
             // A `Value` from a `Value`: hand over a clone, as the text deserializer hands over
             // the value it parsed (a clone shares the document).
-            let val = std::mem::ManuallyDrop::new(self.clone());
-            // #Safety
-            // `ValueVisitor::visit_bytes` takes ownership of the value passed as its bytes; it
-            // is not dropped here.
-            return unsafe {
-                let binary = &*std::ptr::slice_from_raw_parts(
-                    &*val as *const Value as *const u8,
-                    std::mem::size_of::<Value>(),
-                );
-                visitor.visit_bytes(binary)
-            };
+            return hand_off::hand_off(self.clone(), visitor);
         }
         visitor.visit_newtype_struct(self)
     }
