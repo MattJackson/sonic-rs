@@ -22,7 +22,7 @@ pub struct BorrowedError {
 }
 
 impl BorrowedError {
-    fn data(reason: &'static str) -> Self {
+    pub(crate) fn data(reason: &'static str) -> Self {
         Self {
             category: Category::TypeUnmatched,
             reason,

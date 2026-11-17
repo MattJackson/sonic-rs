@@ -364,6 +364,10 @@ where
     where
         V: JsonVisitor<'de>,
     {
+        if self.read.borrowed_decode() {
+            let value = self.parse_borrowed_str()?;
+            return check_visit!(self, vis.visit_borrowed_str(value));
+        }
         if let Some(strbuf) = strbuf {
             let rs = self.parse_str(strbuf)?;
             check_visit!(self, vis.visit_str(rs.as_ref()))

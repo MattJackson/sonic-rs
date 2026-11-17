@@ -1,9 +1,11 @@
 //! Serde between JSON text and Rust data structure.
 
 pub(crate) mod borrowed;
+pub(crate) mod borrowed_native;
 pub(crate) mod borrowed_raw;
 pub(crate) mod de;
 pub use borrowed::{from_slice_borrowed, BorrowedError};
+pub use borrowed_native::from_slice_borrowed_native;
 pub use borrowed_raw::BorrowedRaw;
 pub(crate) mod number;
 pub(crate) mod rawnumber;
