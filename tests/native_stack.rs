@@ -196,8 +196,12 @@ fn cleanup() {
     for shape in 0..3 {
         for leaf in ["[1,]", r#"{"broken":}"#, r#""\uD800""#, "tru", "01"] {
             let input = nested(MAX_DEPTH - 1, shape, leaf);
-            assert!(json::from_str::<Value>(&input).is_err());
-            assert!(json::from_slice::<Value>(input.as_bytes()).is_err());
+            assert!(Deserializer::new(Read::from(input.as_str()))
+                .deserialize::<Value>()
+                .is_err());
+            assert!(Deserializer::new(Read::from(input.as_bytes()))
+                .deserialize::<Value>()
+                .is_err());
             assert_eq!(json::from_str::<Value>("[7]").unwrap()[0].as_u64(), Some(7));
         }
         let input = format!("{} trailing", nested(MAX_DEPTH, shape, "0"));
@@ -205,7 +209,9 @@ fn cleanup() {
         let mut invalid = nested(MAX_DEPTH, shape, r#""x""#).into_bytes();
         let at = invalid.iter().position(|&byte| byte == b'x').unwrap();
         invalid[at] = 0xff;
-        assert!(json::from_slice::<Value>(&invalid).is_err());
+        assert!(Deserializer::new(Read::from(invalid.as_slice()))
+            .deserialize::<Value>()
+            .is_err());
         drop(
             Deserializer::new(Read::from(invalid.as_slice()))
                 .utf8_lossy()
