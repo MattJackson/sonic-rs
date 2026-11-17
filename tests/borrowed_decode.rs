@@ -274,8 +274,31 @@ fn ignored_fields_keep_checked_skip_acceptance_and_strict_escape_validation() {
 #[cfg(feature = "arbitrary_precision")]
 #[test]
 fn arbitrary_precision_wrong_type_errors_do_not_copy_the_numeric_lexeme() {
+    #[derive(Debug)]
+    struct NumberMap;
+    impl<'de> Deserialize<'de> for NumberMap {
+        fn deserialize<D: de::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+            struct NumberMapVisitor;
+            impl<'de> de::Visitor<'de> for NumberMapVisitor {
+                type Value = NumberMap;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a map with boolean values")
+                }
+                fn visit_map<A: de::MapAccess<'de>>(
+                    self,
+                    mut access: A,
+                ) -> Result<NumberMap, A::Error> {
+                    while access.next_entry::<&str, bool>()?.is_some() {}
+                    Ok(NumberMap)
+                }
+            }
+            // deserialize_any selects the private number map; deserialize_map would
+            // reject the numeric token before reaching its borrowed lexeme adapter.
+            decoder.deserialize_any(NumberMapVisitor)
+        }
+    }
     let input = b"123456789012345678901234567890123456789012345678901234567890";
     let mut arena = vec![0; input.len()];
-    let error = from_slice_borrowed::<BTreeMap<&str, bool>>(input, &mut arena).unwrap_err();
+    let error = from_slice_borrowed::<NumberMap>(input, &mut arena).unwrap_err();
     assert!(!format!("{error:?} {error}").contains("12345678901234567890"));
 }
