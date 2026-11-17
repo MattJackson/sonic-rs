@@ -18,9 +18,9 @@ use super::de::tri;
 use crate::{
     config::SerializeCfg,
     error::{Error, ErrorCode, Result},
-    format::{CompactFormatter, Formatter, PrettyFormatter},
+    format::{CompactFormatter, Formatter, PrettyFormatter, StreamingFormatter},
     lazyvalue::value::HasEsc,
-    writer::WriteExt,
+    writer::{IoWriter, WriteExt},
     OwnedLazyValue,
 };
 /// A structure for serializing Rust values into JSON.
@@ -30,6 +30,8 @@ pub struct Serializer<W, F = CompactFormatter> {
     // TODO: record has_escape to optimize lazyvalue
     // has_escape: bool,
     cfg: SerializeCfg,
+    // Enabled only by to_writer_io with its private compact formatter.
+    stream_raw_display: bool,
 }
 
 impl<W> Serializer<W>
@@ -67,6 +69,7 @@ where
             writer,
             formatter,
             cfg: SerializeCfg::default(),
+            stream_raw_display: false,
         }
     }
 
@@ -448,55 +451,54 @@ where
     where
         T: ?Sized + Display,
     {
-        use self::fmt::Write;
-
-        struct Adapter<'ser, W: 'ser, F: 'ser> {
-            writer: &'ser mut W,
-            formatter: &'ser mut F,
-            error: Option<io::Error>,
-        }
-
-        impl<'ser, W, F> Write for Adapter<'ser, W, F>
-        where
-            W: WriteExt,
-            F: Formatter,
-        {
-            fn write_str(&mut self, s: &str) -> fmt::Result {
-                debug_assert!(self.error.is_none());
-                match self.formatter.write_string_fast(self.writer, s, false) {
-                    Ok(()) => Ok(()),
-                    Err(err) => {
-                        self.error = Some(err);
-                        Err(fmt::Error)
-                    }
-                }
-            }
-        }
-
         tri!(self
             .formatter
             .begin_string(&mut self.writer)
             .map_err(Error::io));
-        let mut adapter = Adapter {
-            writer: &mut self.writer,
-            formatter: &mut self.formatter,
-            error: None,
-        };
-
-        match write!(adapter, "{value}") {
-            Ok(()) => {
-                debug_assert!(adapter.error.is_none());
-            }
-            Err(fmt::Error) => {
-                return Err(Error::io(adapter.error.expect("there should be an error")))
-            }
-        }
+        write_display(value, |fragment| {
+            self.formatter
+                .write_string_fast(&mut self.writer, fragment, false)
+        })?;
         tri!(self
             .formatter
             .end_string(&mut self.writer)
             .map_err(Error::io));
         Ok(())
     }
+}
+
+fn formatting_error() -> Error {
+    ser::Error::custom("error while formatting JSON value")
+}
+
+/// Preserve the first sink failure, even if Display swallows it or tries another fragment.
+fn write_display<T: ?Sized + Display>(
+    value: &T,
+    write: impl FnMut(&str) -> io::Result<()>,
+) -> Result<()> {
+    struct Adapter<F> {
+        write: F,
+        error: Option<io::Error>,
+    }
+
+    impl<F: FnMut(&str) -> io::Result<()>> fmt::Write for Adapter<F> {
+        fn write_str(&mut self, fragment: &str) -> fmt::Result {
+            if self.error.is_some() {
+                return Err(fmt::Error);
+            }
+            (self.write)(fragment).map_err(|error| {
+                self.error = Some(error);
+                fmt::Error
+            })
+        }
+    }
+
+    let mut adapter = Adapter { write, error: None };
+    let formatted = fmt::write(&mut adapter, format_args!("{value}"));
+    if let Some(error) = adapter.error {
+        return Err(Error::io(error));
+    }
+    formatted.map_err(|_| formatting_error())
 }
 
 // Not public API. Should be pub(crate).
@@ -1181,7 +1183,7 @@ where
     }
 
     fn serialize_char(self, value: char) -> Result<()> {
-        self.ser.serialize_str(&value.to_string())
+        self.ser.serialize_char(value)
     }
 
     fn serialize_bytes(self, _value: &[u8]) -> Result<()> {
@@ -1400,7 +1402,20 @@ impl<'a, W: WriteExt, F: Formatter> ser::Serializer for RawValueStrEmitter<'a, W
     where
         T: ?Sized + Display,
     {
-        self.serialize_str(&value.to_string())
+        let serializer = self.0;
+        if serializer.stream_raw_display {
+            write_display(value, |fragment| {
+                serializer.writer.write_all(fragment.as_bytes())
+            })
+        } else {
+            // Existing/custom formatters receive one complete raw value, never fragments.
+            let mut raw = String::new();
+            fmt::write(&mut raw, format_args!("{value}")).map_err(|_| formatting_error())?;
+            serializer
+                .formatter
+                .write_raw_value(&mut serializer.writer, &raw)
+                .map_err(Error::io)
+        }
     }
 }
 
@@ -1419,6 +1434,30 @@ where
     T: ?Sized + Serialize,
 {
     let mut ser = Serializer::new(writer);
+    value.serialize(&mut ser)
+}
+
+/// Serialize compact JSON into an ordinary I/O sink without serializer-owned heap staging.
+///
+/// Strings are escaped directly from borrowed segments. The serializer emits the order supplied
+/// by `Serialize`; it does not enable map sorting. Allocations by the input's `Serialize`
+/// implementation or the sink are outside this guarantee. In particular, native [`crate::Value`]
+/// objects still allocate sorting references when the `sort_keys` feature is enabled.
+///
+/// The sink is not flushed. On failure it may hold a JSON prefix; callers must discard incomplete
+/// owned output or defer external publication until serialization succeeds.
+///
+/// # Errors
+/// Returns serialization errors and sink I/O errors. A `Display` implementation used by
+/// `collect_str` that returns a formatting error without an I/O error produces a serialization
+/// error. Its first sink error is preserved even if `Display` ignores that error.
+pub fn to_writer_io<W, T>(writer: W, value: &T) -> Result<()>
+where
+    W: io::Write,
+    T: ?Sized + Serialize,
+{
+    let mut ser = Serializer::with_formatter(IoWriter(writer), StreamingFormatter);
+    ser.stream_raw_display = true;
     value.serialize(&mut ser)
 }
 

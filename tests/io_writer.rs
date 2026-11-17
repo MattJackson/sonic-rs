@@ -3,11 +3,11 @@
 use std::{cell::RefCell, collections::BTreeMap, fmt, io, rc::Rc};
 
 use serde::{ser::SerializeMap, ser::SerializeStruct, Serialize, Serializer};
-use sonic_rs::{format::Formatter, writer::BufferedWriter};
+use sonic_rs::format::Formatter;
 
-// The regression commit uses the old public entrypoint. The fix changes only this routing.
+// The regression commit used to_writer(BufferedWriter); the assertions stay unchanged.
 fn write_json<W: io::Write, T: Serialize + ?Sized>(writer: W, value: &T) -> sonic_rs::Result<()> {
-    sonic_rs::to_writer(BufferedWriter::new(writer), value)
+    sonic_rs::to_writer_io(writer, value)
 }
 
 fn bytes<T: Serialize + ?Sized>(value: &T) -> Vec<u8> {
@@ -313,4 +313,48 @@ fn short_interrupted_and_zero_writes_follow_write_all_semantics() {
     sink.zero = true;
     let error = write_json(&mut sink, "x").unwrap_err();
     assert_eq!(error.io_error_kind(), Some(io::ErrorKind::WriteZero));
+}
+
+#[test]
+fn fallible_growth_refusal_is_reported_without_simulating_global_oom() {
+    struct CannotGrow;
+    impl io::Write for CannotGrow {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::OutOfMemory.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            panic!("must not flush")
+        }
+    }
+    let error = write_json(CannotGrow, "secret").unwrap_err();
+    assert_eq!(error.classify(), sonic_rs::error::Category::Io);
+    assert_eq!(error.io_error_kind(), Some(io::ErrorKind::OutOfMemory));
+}
+
+#[test]
+fn old_writer_collect_str_uses_the_same_sticky_error_rules() {
+    use sonic_rs::writer::BufferedWriter;
+    for ending in [
+        Ending::Propagate,
+        Ending::RetryAndSucceed,
+        Ending::SwallowAndSucceed,
+        Ending::SwallowAndFail,
+    ] {
+        let mut sink = Refusing::at(1);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sonic_rs::to_writer(BufferedWriter::new(&mut sink), &Text(ending))
+        }));
+        let error = outcome.expect("old writer must not panic").unwrap_err();
+        assert_eq!(error.io_error_kind(), Some(io::ErrorKind::BrokenPipe));
+        assert_eq!(sink.bytes, b"\"");
+        assert_eq!(sink.writes_after_error, 0);
+    }
+    let outcome = std::panic::catch_unwind(|| sonic_rs::to_vec(&Raw(Text(Ending::BareFailure))));
+    assert_eq!(
+        outcome
+            .expect("old raw formatter must not panic")
+            .unwrap_err()
+            .classify(),
+        sonic_rs::error::Category::TypeUnmatched
+    );
 }

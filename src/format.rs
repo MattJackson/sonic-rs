@@ -4,7 +4,11 @@
 
 use std::io::{self, Write};
 
-use crate::{serde::tri, util::string::format_string, writer::WriteExt};
+use crate::{
+    serde::tri,
+    util::string::{format_string, QUOTE_TAB},
+    writer::WriteExt,
+};
 
 /// This trait abstracts away serializing the JSON control characters, which allows the user to
 /// optionally pretty print the JSON output.
@@ -428,6 +432,44 @@ pub trait Formatter: Clone {
 pub struct CompactFormatter;
 
 impl Formatter for CompactFormatter {}
+
+/// Compact output to an ordinary I/O sink without staging strings in reserved storage.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamingFormatter;
+
+impl Formatter for StreamingFormatter {
+    fn write_string_fast<W: WriteExt + ?Sized>(
+        &mut self,
+        writer: &mut W,
+        value: &str,
+        need_quote: bool,
+    ) -> io::Result<()> {
+        if need_quote {
+            writer.write_all(b"\"")?;
+        }
+        let bytes = value.as_bytes();
+        let mut start = 0;
+        for (at, byte) in bytes.iter().copied().enumerate() {
+            let (length, escaped) = &QUOTE_TAB[usize::from(byte)];
+            if *length == 0 {
+                continue;
+            }
+            // Escape bytes are ASCII, so these borrowed runs end on UTF-8 boundaries.
+            if start != at {
+                writer.write_all(&bytes[start..at])?;
+            }
+            writer.write_all(&escaped[..usize::from(*length)])?;
+            start = at + 1;
+        }
+        if start != bytes.len() {
+            writer.write_all(&bytes[start..])?;
+        }
+        if need_quote {
+            writer.write_all(b"\"")?;
+        }
+        Ok(())
+    }
+}
 
 /// This structure pretty prints a JSON value to make it human readable.
 #[derive(Clone, Debug)]
