@@ -99,12 +99,17 @@ fn native_stack_child() {
 
 fn boundary() {
     for shape in 0..3 {
-        for leaf in ["0", "true", r#""escaped\nstring""#] {
-            let input = nested(MAX_DEPTH, shape, leaf);
-            drop(json::from_str::<Value>(&input).unwrap());
-            drop(json::from_slice::<Value>(input.as_bytes()).unwrap());
+        for depth in [0, 1, 127, 128, 129, 253, MAX_DEPTH] {
+            for leaf in ["0", "true", r#""escaped\nstring""#] {
+                let compact = nested(depth, shape, leaf);
+                let spaced = compact.replace('[', "[ \n ").replace('{', "{ \n ");
+                for input in [compact, spaced] {
+                    drop(json::from_str::<Value>(&input).unwrap());
+                    drop(json::from_slice::<Value>(input.as_bytes()).unwrap());
+                }
+            }
         }
-        for depth in [MAX_DEPTH + 1, 2_000, 10_000] {
+        for depth in [MAX_DEPTH + 1, MAX_DEPTH + 2, 2_000, 10_000] {
             let input = nested(depth, shape, "0");
             depth_error(json::from_str::<Value>(&input));
             depth_error(json::from_slice::<Value>(input.as_bytes()));
@@ -194,6 +199,13 @@ fn lifecycle() {
 
 fn cleanup() {
     for shape in 0..3 {
+        // A rejected late branch must clean up already materialized siblings on this worker.
+        let prefix = vec![r#"{"ready":[1,2,3],"text":"allocated\nstring"}"#; 1_024].join(",");
+        let oversized = format!("[{prefix},{}]", nested(2_000, shape, "0"));
+        for _ in 0..8 {
+            depth_error(json::from_str::<Value>(&oversized));
+            drop(json::from_str::<Value>("{\"next\":[7]}").unwrap());
+        }
         for leaf in ["[1,]", r#"{"broken":}"#, r#""\uD800""#, "tru", "01"] {
             let input = nested(MAX_DEPTH - 1, shape, leaf);
             assert!(Deserializer::new(Read::from(input.as_str()))
