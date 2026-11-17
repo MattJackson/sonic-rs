@@ -134,6 +134,20 @@ impl<'de> Visitor<'de> for ValueVisitor {
         ValueBuilder.visit_u64(v)
     }
 
+    fn visit_i128<E>(self, v: i128) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_i128(v)
+    }
+
+    fn visit_u128<E>(self, v: u128) -> StdResult<Value, E>
+    where
+        E: de::Error,
+    {
+        ValueBuilder.visit_u128(v)
+    }
+
     fn visit_f64<E>(self, v: f64) -> StdResult<Value, E>
     where
         E: de::Error,
@@ -223,6 +237,17 @@ impl<'de> Visitor<'de> for ValueBuilder {
         Ok(Value::new_f64(v).unwrap_or_default())
     }
 
+    /// With `arbitrary_precision`, a 128-bit integer is kept exactly, as a raw number.
+    #[cfg(feature = "arbitrary_precision")]
+    fn visit_i128<E>(self, v: i128) -> StdResult<Value, E> {
+        Ok(Value::new_rawnum(&v.to_string()))
+    }
+
+    #[cfg(feature = "arbitrary_precision")]
+    fn visit_u128<E>(self, v: u128) -> StdResult<Value, E> {
+        Ok(Value::new_rawnum(&v.to_string()))
+    }
+
     fn visit_str<E>(self, v: &str) -> StdResult<Value, E> {
         Ok(Value::from(v))
     }
@@ -265,11 +290,114 @@ impl<'de> Visitor<'de> for ValueBuilder {
         A: MapAccess<'de>,
     {
         let mut object = Object::with_capacity(map.size_hint().unwrap_or(0));
-        while let Some(key) = map.next_key::<String>()? {
+        // With `arbitrary_precision`, a one-entry map keyed by sonic-rs's own number token is a
+        // number, as `deserialize_any` hands it out with `use_rawnumber_in_any`. A key merely
+        // spelled like the token (read from a document, an owned string) is an ordinary key.
+        #[cfg(feature = "arbitrary_precision")]
+        let mut next = match map.next_key_seed(FirstKeySeed)? {
+            Some(FirstKey::Number) => {
+                let lexeme = map.next_value_seed(LexemeSeed)?;
+                if map.next_key::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom("a number holds exactly one entry"));
+                }
+                return Ok(Value::new_rawnum(&lexeme));
+            }
+            Some(FirstKey::Text(key)) => Some(key),
+            None => None,
+        };
+        #[cfg(not(feature = "arbitrary_precision"))]
+        let mut next = map.next_key::<String>()?;
+        while let Some(key) = next {
             let value = map.next_value_seed(ValueBuilder)?;
             object.insert(&key, value);
+            next = map.next_key::<String>()?;
         }
         Ok(object.into_value())
+    }
+}
+
+/// The first key of a map being built: sonic-rs's own number token, or text.
+#[cfg(feature = "arbitrary_precision")]
+enum FirstKey {
+    Number,
+    Text(String),
+}
+
+#[cfg(feature = "arbitrary_precision")]
+struct FirstKeySeed;
+
+#[cfg(feature = "arbitrary_precision")]
+impl<'de> DeserializeSeed<'de> for FirstKeySeed {
+    type Value = FirstKey;
+
+    fn deserialize<D>(self, deserializer: D) -> StdResult<FirstKey, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_string(self)
+    }
+}
+
+#[cfg(feature = "arbitrary_precision")]
+impl<'de> Visitor<'de> for FirstKeySeed {
+    type Value = FirstKey;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a string key")
+    }
+
+    /// The token is recognised by address: a borrowed key that is the very `NUMBER_TOKEN` static
+    /// came from sonic-rs itself.
+    fn visit_borrowed_str<E>(self, v: &'de str) -> StdResult<FirstKey, E> {
+        if crate::serde::rawnumber::is_number_token(v) {
+            Ok(FirstKey::Number)
+        } else {
+            Ok(FirstKey::Text(v.to_owned()))
+        }
+    }
+
+    fn visit_str<E>(self, v: &str) -> StdResult<FirstKey, E> {
+        Ok(FirstKey::Text(v.to_owned()))
+    }
+
+    fn visit_string<E>(self, v: String) -> StdResult<FirstKey, E> {
+        Ok(FirstKey::Text(v))
+    }
+}
+
+/// The text of a number entry: it must be a JSON number.
+#[cfg(feature = "arbitrary_precision")]
+struct LexemeSeed;
+
+#[cfg(feature = "arbitrary_precision")]
+impl<'de> DeserializeSeed<'de> for LexemeSeed {
+    type Value = String;
+
+    fn deserialize<D>(self, deserializer: D) -> StdResult<String, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_str(self)
+    }
+}
+
+#[cfg(feature = "arbitrary_precision")]
+impl<'de> Visitor<'de> for LexemeSeed {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON number")
+    }
+
+    fn visit_str<E>(self, v: &str) -> StdResult<String, E>
+    where
+        E: de::Error,
+    {
+        if crate::serde::rawnumber::is_json_number(v) {
+            Ok(v.to_owned())
+        } else {
+            Err(E::invalid_value(Unexpected::Str(v), &self))
+        }
     }
 }
 

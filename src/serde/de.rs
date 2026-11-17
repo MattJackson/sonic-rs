@@ -58,6 +58,42 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
         self
     }
 
+    /// Like [`use_rawnumber`](Self::use_rawnumber), and also keep a number's text when serde
+    /// buffers it (`#[serde(untagged)]`, internally tagged enums, `#[serde(flatten)]`), so a
+    /// [`Value`](crate::Value) inside them keeps every digit. Requires the `arbitrary_precision`
+    /// feature.
+    ///
+    /// A number read through `deserialize_any` is then handed as a one-entry map from a private
+    /// token to its text, as serde_json does with its `arbitrary_precision` feature. `Value` and
+    /// [`Number`](crate::Number) read it back, but other types that read a number through
+    /// `deserialize_any` do not: `serde_json::Value`, and numeric fields (`u64`, `f64`, ...)
+    /// inside untagged or internally tagged enums or flattened structs, get a map or fail.
+    ///
+    /// # Example
+    /// ```
+    /// use serde::Deserialize;
+    /// use sonic_rs::{Deserializer, Value};
+    ///
+    /// #[derive(Deserialize)]
+    /// struct Event {
+    ///     kind: String,
+    ///     #[serde(flatten)]
+    ///     rest: Value,
+    /// }
+    ///
+    /// let json = r#"{"kind":"x","amount":0.1000000000000000000001}"#;
+    /// let mut de = Deserializer::from_str(json).use_rawnumber_in_any();
+    /// let event: Event = de.deserialize().unwrap();
+    /// let out = sonic_rs::to_string(&event.rest).unwrap();
+    /// assert_eq!(out, r#"{"amount":0.1000000000000000000001}"#);
+    /// ```
+    #[cfg(feature = "arbitrary_precision")]
+    pub fn use_rawnumber_in_any(mut self) -> Self {
+        self.parser.cfg.use_rawnumber = true;
+        self.parser.cfg.use_rawnumber_in_any = true;
+        self
+    }
+
     /// Allow to parse JSON with invalid UTF-8 and UTF-16 characters. Will replace them with
     /// `\uFFFD` (displayed as �).
     ///
@@ -247,6 +283,17 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
                 tri!(self.parser.parse_literal("alse"));
                 visitor.visit_bool(false)
             }
+            // Opted in with `use_rawnumber_in_any`, `deserialize_any` keeps a number's text: it
+            // hands it as a one-entry map from the number token (borrowed, so its address
+            // survives buffering in serde's `Content`) to the text.
+            #[cfg(feature = "arbitrary_precision")]
+            c @ b'-' | c @ b'0'..=b'9' if self.parser.cfg.use_rawnumber_in_any => {
+                let lexeme = tri!(self.parser.skip_number(c));
+                visitor.visit_map(NumberMapAccess {
+                    lexeme,
+                    key_done: false,
+                })
+            }
             c @ b'-' | c @ b'0'..=b'9' => visit_number(&tri!(self.parser.parse_number(c)), visitor),
             b'"' => match tri!(self.parser.parse_str(&mut self.scratch)) {
                 Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
@@ -266,6 +313,46 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
         let result = f(self);
         self.parser.leave_nested();
         result
+    }
+}
+
+/// A number as `deserialize_any` hands it with `use_rawnumber_in_any`: a one-entry map from the
+/// number token (`rawnumber::NUMBER_TOKEN`, borrowed) to the number's text.
+#[cfg(feature = "arbitrary_precision")]
+struct NumberMapAccess<'de> {
+    lexeme: &'de str,
+    key_done: bool,
+}
+
+#[cfg(feature = "arbitrary_precision")]
+impl<'de> de::MapAccess<'de> for NumberMapAccess<'de> {
+    type Error = Error;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>>
+    where
+        K: de::DeserializeSeed<'de>,
+    {
+        if self.key_done {
+            return Ok(None);
+        }
+        self.key_done = true;
+        seed.deserialize(de::value::BorrowedStrDeserializer::<Error>::new(
+            crate::serde::rawnumber::number_token(),
+        ))
+        .map(Some)
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value>
+    where
+        V: de::DeserializeSeed<'de>,
+    {
+        seed.deserialize(de::value::BorrowedStrDeserializer::<Error>::new(
+            self.lexeme,
+        ))
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(usize::from(!self.key_done))
     }
 }
 
