@@ -305,7 +305,7 @@ where
             reason = EofWhileParsing;
             index = len;
         }
-        Error::syntax(reason, self.read.origin_input(), index)
+        self.read.error_at(reason, index)
     }
 
     // maybe error in generated in visitor, so we need fix the position.
@@ -841,6 +841,65 @@ where
         }
     }
 
+    /// Decode into a disjoint caller-owned region. The reader is immediately after a quote.
+    /// Scanning shares the checked string grammar; only escaped strings consume arena space.
+    pub(crate) fn parse_borrowed_str(&mut self) -> Result<&'de str> {
+        let start = self.read.index();
+        let status = self.skip_string()?;
+        self.check_invalid_utf8(false)?;
+        let end = self.read.index() - 1;
+        if status != ParseStatus::HasEscaped {
+            return std::str::from_utf8(&self.read.as_u8_slice()[start..end])
+                .map_err(|_| self.error(InvalidUTF8));
+        }
+        let arena = self
+            .read
+            .take_decode_arena()
+            .ok_or_else(|| self.error(UnexpectedVisitType))?;
+        let extent = end - start;
+        if arena.len() < extent {
+            self.read.return_decode_arena(arena);
+            return Err(self.error(UnexpectedVisitType));
+        }
+        let (output, remaining) = arena.split_at_mut(extent);
+        self.read.return_decode_arena(remaining);
+        self.read.set_index(start);
+        let mut written = 0;
+        while self.read.index() < end {
+            let byte = self
+                .read
+                .next()
+                .ok_or_else(|| self.error(EofWhileParsing))?;
+            if byte == b'\\' {
+                let escaped = self
+                    .read
+                    .next()
+                    .ok_or_else(|| self.error(EofWhileParsing))?;
+                if escaped == b'u' {
+                    let point = self.parse_escaped_utf8()?;
+                    let ch =
+                        char::from_u32(point).ok_or_else(|| self.error(InvalidUnicodeCodePoint))?;
+                    let mut encoded = [0; 4];
+                    let bytes = ch.encode_utf8(&mut encoded).as_bytes();
+                    output[written..written + bytes.len()].copy_from_slice(bytes);
+                    written += bytes.len();
+                } else {
+                    let decoded = ESCAPED_TAB[escaped as usize];
+                    if decoded == 0 {
+                        return Err(self.error(InvalidEscape));
+                    }
+                    output[written] = decoded;
+                    written += 1;
+                }
+            } else {
+                output[written] = byte;
+                written += 1;
+            }
+        }
+        self.read.set_index(end + 1);
+        std::str::from_utf8(&output[..written]).map_err(|_| self.error(InvalidUTF8))
+    }
+
     pub(crate) fn check_invalid_utf8(&mut self, allowed: bool) -> Result<bool> {
         // the invalid UTF-8 before the string, must have been checked before.
         let invalid = self.read.next_invalid_utf8();
@@ -849,11 +908,7 @@ where
         }
 
         if !allowed {
-            Err(Error::syntax(
-                ErrorCode::InvalidUTF8,
-                self.read.origin_input(),
-                invalid,
-            ))
+            Err(self.read.error_at(ErrorCode::InvalidUTF8, invalid))
         } else {
             // this space is allowed, should update the next invalid utf8 position
             self.read.check_invalid_utf8();
@@ -1170,6 +1225,14 @@ where
     }
 
     fn skip_escaped_chars(&mut self) -> Result<()> {
+        if self.read.borrowed_decode() && self.read.peek() == Some(b'u') {
+            self.read.eat(1);
+            let point = self.parse_escaped_utf8()?;
+            if char::from_u32(point).is_none() {
+                return Err(self.error(InvalidUnicodeCodePoint));
+            }
+            return Ok(());
+        }
         match self.read.peek() {
             Some(b'u') => {
                 if self.read.remain() < 6 {
@@ -2087,6 +2150,14 @@ where
 
     #[cold]
     pub fn peek_invalid_type(&mut self, peek: u8, exp: &dyn Expected) -> Error {
+        if self.read.borrowed_decode() {
+            // Validate the unexpected token without decoding it into the ordinary local Vec.
+            self.read.backward(1);
+            return match self.skip_one(true) {
+                Ok(_) => self.error(UnexpectedVisitType),
+                Err(error) => error,
+            };
+        }
         let err = match peek {
             b'n' => {
                 if let Err(err) = self.parse_literal("ull") {

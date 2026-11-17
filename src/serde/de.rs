@@ -254,9 +254,13 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
                 visitor.visit_map(NumberMapAccess {
                     lexeme,
                     key_done: false,
+                    borrowed: self.parser.read.borrowed_decode(),
                 })
             }
             c @ b'-' | c @ b'0'..=b'9' => visit_number(&tri!(self.parser.parse_number(c)), visitor),
+            b'"' if self.parser.read.borrowed_decode() => {
+                visitor.visit_borrowed_str(tri!(self.parser.parse_borrowed_str()))
+            }
             b'"' => match tri!(self.parser.parse_str(&mut self.scratch)) {
                 Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
                 Reference::Copied(s) => visitor.visit_str(s),
@@ -284,6 +288,7 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
 struct NumberMapAccess<'de> {
     lexeme: &'de str,
     key_done: bool,
+    borrowed: bool,
 }
 
 #[cfg(feature = "arbitrary_precision")]
@@ -298,6 +303,14 @@ impl<'de> de::MapAccess<'de> for NumberMapAccess<'de> {
             return Ok(None);
         }
         self.key_done = true;
+        if self.borrowed {
+            return seed
+                .deserialize(de::value::BorrowedStrDeserializer::<
+                    super::borrowed::BorrowedError,
+                >::new(crate::serde::rawnumber::NUMBER_TOKEN))
+                .map(Some)
+                .map_err(|_| Error::ser_error(ErrorCode::UnexpectedVisitType));
+        }
         seed.deserialize(de::value::BorrowedStrDeserializer::<Error>::new(
             crate::serde::rawnumber::NUMBER_TOKEN,
         ))
@@ -308,6 +321,13 @@ impl<'de> de::MapAccess<'de> for NumberMapAccess<'de> {
     where
         V: de::DeserializeSeed<'de>,
     {
+        if self.borrowed {
+            return seed
+                .deserialize(de::value::BorrowedStrDeserializer::<
+                    super::borrowed::BorrowedError,
+                >::new(self.lexeme))
+                .map_err(|_| Error::ser_error(ErrorCode::UnexpectedVisitType));
+        }
         seed.deserialize(de::value::BorrowedStrDeserializer::<Error>::new(
             self.lexeme,
         ))
@@ -391,10 +411,9 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
         }
     }
 
-    fn scan_integer128(&mut self, buf: &mut String) -> Result<()> {
+    fn scan_integer128(&mut self) -> Result<()> {
         match self.parser.read.peek() {
             Some(b'0') => {
-                buf.push('0');
                 self.parser.read.eat(1);
                 // There can be only one leading '0'.
                 if let Some(ch) = self.parser.read.peek() {
@@ -405,11 +424,9 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
                 Ok(())
             }
             Some(c) if c.is_ascii_digit() => {
-                buf.push(c as char);
                 self.parser.read.eat(1);
-                while let c @ b'0'..=b'9' = self.parser.read.peek().unwrap_or_default() {
+                while matches!(self.parser.read.peek(), Some(b'0'..=b'9')) {
                     self.parser.read.eat(1);
-                    buf.push(c as char);
                 }
                 Ok(())
             }
@@ -644,10 +661,10 @@ impl<'de, 'a, R: Reader<'de>> de::Deserializer<'de> for &'a mut Deserializer<R> 
     where
         V: de::Visitor<'de>,
     {
-        let mut buf = String::new();
-        match self.parser.skip_space_peek() {
+        let peek = self.parser.skip_space_peek();
+        let start = self.parser.read.index();
+        match peek {
             Some(b'-') => {
-                buf.push('-');
                 self.parser.read.eat(1);
             }
             Some(_) => {}
@@ -656,7 +673,8 @@ impl<'de, 'a, R: Reader<'de>> de::Deserializer<'de> for &'a mut Deserializer<R> 
             }
         };
 
-        tri!(self.scan_integer128(&mut buf));
+        tri!(self.scan_integer128());
+        let buf = as_str(&self.parser.read.as_u8_slice()[start..self.parser.read.index()]);
 
         let value = match buf.parse() {
             Ok(int) => visitor.visit_i128(int),
@@ -682,8 +700,9 @@ impl<'de, 'a, R: Reader<'de>> de::Deserializer<'de> for &'a mut Deserializer<R> 
             }
         }
 
-        let mut buf = String::new();
-        tri!(self.scan_integer128(&mut buf));
+        let start = self.parser.read.index();
+        tri!(self.scan_integer128());
+        let buf = as_str(&self.parser.read.as_u8_slice()[start..self.parser.read.index()]);
 
         let value = match buf.parse() {
             Ok(int) => visitor.visit_u128(int),
@@ -711,6 +730,9 @@ impl<'de, 'a, R: Reader<'de>> de::Deserializer<'de> for &'a mut Deserializer<R> 
         };
 
         let value = match peek {
+            b'"' if self.parser.read.borrowed_decode() => {
+                visitor.visit_borrowed_str(tri!(self.parser.parse_borrowed_str()))
+            }
             b'"' => match tri!(self.parser.parse_str(&mut self.scratch)) {
                 Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
                 Reference::Copied(s) => visitor.visit_str(s),
@@ -741,6 +763,9 @@ impl<'de, 'a, R: Reader<'de>> de::Deserializer<'de> for &'a mut Deserializer<R> 
         };
 
         let value = match peek {
+            b'"' if self.parser.read.borrowed_decode() => {
+                visitor.visit_borrowed_bytes(tri!(self.parser.parse_borrowed_str()).as_bytes())
+            }
             b'"' => match tri!(self.parser.parse_string_raw(&mut self.scratch)) {
                 ParsedSlice::Borrowed { slice: b, buf: _ } => visitor.visit_borrowed_bytes(b),
                 ParsedSlice::Copied(b) => visitor.visit_bytes(b),
@@ -753,7 +778,9 @@ impl<'de, 'a, R: Reader<'de>> de::Deserializer<'de> for &'a mut Deserializer<R> 
         };
 
         // check invalid utf8 with allow space here
-        let _ = self.parser.check_invalid_utf8(true)?;
+        let _ = self
+            .parser
+            .check_invalid_utf8(!self.parser.read.borrowed_decode())?;
         self.fix_position(value)
     }
 
@@ -813,6 +840,29 @@ impl<'de, 'a, R: Reader<'de>> de::Deserializer<'de> for &'a mut Deserializer<R> 
     where
         V: de::Visitor<'de>,
     {
+        if name == super::borrowed_raw::TOKEN {
+            if !self.parser.read.borrowed_decode() {
+                return Err(self.parser.error(ErrorCode::UnexpectedVisitType));
+            }
+            let (raw, _) = self.parser.skip_one(true)?;
+            self.parser.check_invalid_utf8(false)?;
+            return visitor.visit_borrowed_str(as_str(raw));
+        }
+        if self.parser.read.borrowed_decode()
+            && matches!(
+                name,
+                crate::serde::rawnumber::TOKEN
+                    | crate::lazyvalue::TOKEN
+                    | crate::lazyvalue::OWNED_LAZY_VALUE_TOKEN
+                    | crate::value::de::TOKEN
+            )
+        {
+            return Err(self
+                .parser
+                .error(ErrorCode::Message(std::borrow::Cow::Borrowed(
+                    "unsupported native JSON type",
+                ))));
+        }
         {
             if name == crate::serde::rawnumber::TOKEN {
                 return self.deserialize_rawnumber(visitor);
@@ -1263,6 +1313,9 @@ where
     where
         V: de::Visitor<'de>,
     {
+        if self.de.parser.read.borrowed_decode() {
+            return visitor.visit_borrowed_str(self.de.parser.parse_borrowed_str()?);
+        }
         self.de.scratch.clear();
         match tri!(self.de.parser.parse_str(&mut self.de.scratch)) {
             Reference::Borrowed(s) => visitor.visit_borrowed_str(s),
@@ -1320,10 +1373,27 @@ where
     }
 
     #[inline]
-    fn deserialize_newtype_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>
+    fn deserialize_newtype_struct<V>(self, name: &'static str, visitor: V) -> Result<V::Value>
     where
         V: de::Visitor<'de>,
     {
+        if self.de.parser.read.borrowed_decode()
+            && matches!(
+                name,
+                super::borrowed_raw::TOKEN
+                    | crate::serde::rawnumber::TOKEN
+                    | crate::lazyvalue::TOKEN
+                    | crate::lazyvalue::OWNED_LAZY_VALUE_TOKEN
+                    | crate::value::de::TOKEN
+            )
+        {
+            return Err(self
+                .de
+                .parser
+                .error(ErrorCode::Message(std::borrow::Cow::Borrowed(
+                    "unsupported native JSON type",
+                ))));
+        }
         visitor.visit_newtype_struct(self)
     }
 
