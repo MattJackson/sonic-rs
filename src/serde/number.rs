@@ -232,6 +232,61 @@ impl<'de> Deserialize<'de> for Number {
             {
                 Number::from_f64(value).ok_or_else(|| de::Error::custom("not a JSON number"))
             }
+
+            /// With `use_rawnumber_in_any`, `deserialize_any` hands a number as a one-entry map
+            /// from the number token to its text: read the text in binary64.
+            #[cfg(feature = "arbitrary_precision")]
+            fn visit_map<A>(self, mut map: A) -> Result<Number, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                struct TokenKey;
+
+                impl<'de> de::DeserializeSeed<'de> for TokenKey {
+                    type Value = ();
+
+                    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+                    where
+                        D: Deserializer<'de>,
+                    {
+                        deserializer.deserialize_str(self)
+                    }
+                }
+
+                impl<'de> Visitor<'de> for TokenKey {
+                    type Value = ();
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                        formatter.write_str("a JSON number")
+                    }
+
+                    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<(), E>
+                    where
+                        E: de::Error,
+                    {
+                        if crate::serde::rawnumber::is_number_token(v) {
+                            Ok(())
+                        } else {
+                            Err(E::custom("not a JSON number"))
+                        }
+                    }
+                }
+
+                if map.next_key_seed(TokenKey)?.is_none() {
+                    return Err(de::Error::custom("not a JSON number"));
+                }
+                let lexeme: String = map.next_value()?;
+                if map.next_key::<de::IgnoredAny>()?.is_some()
+                    || !crate::serde::rawnumber::is_json_number(&lexeme)
+                {
+                    return Err(de::Error::custom("not a JSON number"));
+                }
+                // A plain deserializer: without `use_rawnumber_in_any` it hands the number
+                // itself, not the token map again (`crate::from_str` could recurse).
+                crate::Deserializer::from_str(&lexeme)
+                    .deserialize::<Number>()
+                    .map_err(|_| de::Error::custom("not a JSON number"))
+            }
         }
 
         deserializer.deserialize_any(NumberVisitor)

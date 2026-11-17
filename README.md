@@ -461,6 +461,8 @@ By default, sonic-rs uses floating point precision consistent with the Rust stan
 
 If you want to achieve lossless precision when parsing floating-point numbers, such as Golang `encoding/json.Number` and `serde-json arbitrary_precision`, you can use `sonic_rs::RawNumber`.
 
+With the `arbitrary_precision` feature, `sonic_rs::Value` keeps every number's text. When serde buffers a `Value` (`#[serde(untagged)]`, internally tagged enums, `#[serde(flatten)]`), its numbers go through `deserialize_any` and are read in binary64, unless the deserializer opts in with `Deserializer::use_rawnumber_in_any()`. That setting has the trade-off of serde_json's `arbitrary_precision`: other types that read a number through `deserialize_any` (`serde_json::Value`, numeric fields in those buffered types) get a map instead of the number. See its documentation.
+
 
 ## Acknowledgement
 

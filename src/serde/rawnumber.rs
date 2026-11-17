@@ -50,6 +50,68 @@ impl RawNumber {
 
 pub(crate) const TOKEN: &str = "$sonic_rs::private::JsonNumber";
 
+/// The key of the one-entry map that `deserialize_any` hands a number as, with
+/// `Deserializer::use_rawnumber_in_any`.
+///
+/// It is a static byte array, not a string literal: a static has an address of its own, which no
+/// other string (an equal literal, a key read from a document) can share. [`is_number_token`]
+/// recognises it by that address, so a key merely spelled the same stays an ordinary key.
+#[cfg(feature = "arbitrary_precision")]
+static NUMBER_TOKEN: [u8; 26] = *b"$sonic_rs::private::Number";
+
+/// [`NUMBER_TOKEN`] as a string.
+#[cfg(feature = "arbitrary_precision")]
+pub(crate) fn number_token() -> &'static str {
+    match std::str::from_utf8(&NUMBER_TOKEN) {
+        Ok(token) => token,
+        Err(_) => unreachable!("the number token is ASCII"),
+    }
+}
+
+/// Whether `s` is [`NUMBER_TOKEN`] itself (same address and length), not merely equal text.
+#[cfg(feature = "arbitrary_precision")]
+pub(crate) fn is_number_token(s: &str) -> bool {
+    std::ptr::eq(s.as_ptr(), NUMBER_TOKEN.as_ptr()) && s.len() == NUMBER_TOKEN.len()
+}
+
+/// Whether `s` is a whole JSON number: `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`.
+#[cfg(feature = "arbitrary_precision")]
+pub(crate) fn is_json_number(s: &str) -> bool {
+    let b = s.as_bytes();
+    let digits = |mut i: usize| {
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        (i, i > start)
+    };
+    let mut i = usize::from(b.first() == Some(&b'-'));
+    match b.get(i) {
+        Some(b'0') => i += 1,
+        Some(b'1'..=b'9') => i = digits(i).0,
+        _ => return false,
+    }
+    if b.get(i) == Some(&b'.') {
+        let (end, any) = digits(i + 1);
+        if !any {
+            return false;
+        }
+        i = end;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let (end, any) = digits(i);
+        if !any {
+            return false;
+        }
+        i = end;
+    }
+    i == b.len()
+}
+
 impl<'de> Deserialize<'de> for RawNumber {
     #[inline]
     fn deserialize<D>(deserializer: D) -> Result<RawNumber, D::Error>
