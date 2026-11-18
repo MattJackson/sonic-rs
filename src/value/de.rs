@@ -9,6 +9,8 @@ use ::serde::{
 };
 
 use super::node::ValueRef;
+#[cfg(feature = "arbitrary_precision")]
+use super::node::ValueRefInner;
 use crate::{
     error::{Error, ErrorCode},
     reader::Reader,
@@ -740,6 +742,29 @@ macro_rules! deserialize_number {
     };
 }
 
+/// A 128-bit integer field. With `arbitrary_precision` a raw number keeps its lexeme, and an integer
+/// lexeme of the field's type is read from it exactly; any other number (beyond the type, a
+/// fraction, an exponent) takes the ordinary number path, where it is refused, never rounded.
+macro_rules! deserialize_wide_integer {
+    ($method:ident, $ty:ty, $visit:ident) => {
+        fn $method<V>(self, visitor: V) -> Result<V::Value, Error>
+        where
+            V: Visitor<'de>,
+        {
+            #[cfg(feature = "arbitrary_precision")]
+            if let ValueRefInner::RawNum(raw) = self.as_ref2() {
+                if let Ok(int) = raw.parse::<$ty>() {
+                    return visitor.$visit(int);
+                }
+            }
+            match self.as_ref() {
+                ValueRef::Number(n) => n.deserialize_any(visitor),
+                _ => Err(self.invalid_type(&visitor)),
+            }
+        }
+    };
+}
+
 impl Value {
     #[cold]
     fn invalid_type<E>(&self, exp: &dyn Expected) -> E
@@ -895,12 +920,12 @@ impl<'de> serde::Deserializer<'de> for &'de Value {
     deserialize_number!(deserialize_i16);
     deserialize_number!(deserialize_i32);
     deserialize_number!(deserialize_i64);
-    deserialize_number!(deserialize_i128);
+    deserialize_wide_integer!(deserialize_i128, i128, visit_i128);
     deserialize_number!(deserialize_u8);
     deserialize_number!(deserialize_u16);
     deserialize_number!(deserialize_u32);
     deserialize_number!(deserialize_u64);
-    deserialize_number!(deserialize_u128);
+    deserialize_wide_integer!(deserialize_u128, u128, visit_u128);
     deserialize_number!(deserialize_f32);
     deserialize_number!(deserialize_f64);
 

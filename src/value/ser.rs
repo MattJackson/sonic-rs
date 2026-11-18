@@ -80,6 +80,19 @@ macro_rules! forward_to {
 use super::JsonValueTrait;
 use crate::serde::tri;
 
+/// A 128-bit integer beyond the 64-bit ranges. With `arbitrary_precision` it is kept exactly, as a
+/// raw number, as the `Value` builder keeps one it is handed (`visit_i128`, `visit_u128`); without
+/// it, `Value` has no exact form for it and it is refused.
+#[cfg(feature = "arbitrary_precision")]
+fn wide_integer(value: impl Display) -> Result<Value> {
+    Ok(Value::new_rawnum(&value.to_string()))
+}
+
+#[cfg(not(feature = "arbitrary_precision"))]
+fn wide_integer(_value: impl Display) -> Result<Value> {
+    Err(Error::ser_error(ErrorCode::NumberOutOfRange))
+}
+
 impl serde::Serializer for Serializer {
     type Ok = Value;
     type Error = Error;
@@ -118,8 +131,7 @@ impl serde::Serializer for Serializer {
         } else if let Ok(value) = i64::try_from(value) {
             Ok(Value::new_i64(value))
         } else {
-            // FIXME: print i128 in error message
-            Err(Error::ser_error(ErrorCode::NumberOutOfRange))
+            wide_integer(value)
         }
     }
 
@@ -138,7 +150,7 @@ impl serde::Serializer for Serializer {
         if let Ok(value) = u64::try_from(value) {
             Ok(Value::new_u64(value))
         } else {
-            Err(Error::ser_error(ErrorCode::NumberOutOfRange))
+            wide_integer(value)
         }
     }
 
