@@ -22,6 +22,30 @@ pub trait WriteExt: io::Write {
     unsafe fn flush_len(&mut self, additional: usize) -> io::Result<()>;
 }
 
+/// Used only with the private streaming formatter, which never reserves scratch storage.
+pub(crate) struct IoWriter<W>(pub(crate) W);
+
+impl<W: io::Write> io::Write for IoWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl<W: io::Write> WriteExt for IoWriter<W> {
+    fn reserve_with(&mut self, _additional: usize) -> io::Result<&mut [MaybeUninit<u8>]> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    unsafe fn flush_len(&mut self, _additional: usize) -> io::Result<()> {
+        // No reservation is possible, so no uninitialized memory can be committed.
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
 /// Wrapper around generic I/O streams implementing [`WriteExt`]
 ///
 /// It internally maintains a buffer for fast operations which it then flushes

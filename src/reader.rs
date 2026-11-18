@@ -1,3 +1,5 @@
+use crate::serde::borrowed::BorrowedError;
+use std::sync::OnceLock;
 use std::{marker::PhantomData, pin::Pin, ptr::NonNull};
 
 use faststr::FastStr;
@@ -39,6 +41,35 @@ impl Position {
 /// implemented for types outside of sonic_rs.
 #[doc(hidden)]
 pub trait Reader<'de>: Sealed {
+    /// Whether strings and errors use the caller-owned borrowed decode policy.
+    fn borrowed_decode(&self) -> bool {
+        false
+    }
+    fn borrowed_error(&self) -> Option<BorrowedError> {
+        None
+    }
+    fn record_borrowed_error(&self, _error: BorrowedError) {}
+
+    /// Temporarily take the unpublished suffix of the decoded-string arena.
+    fn take_decode_arena(&mut self) -> Option<&'de mut [u8]> {
+        None
+    }
+
+    /// Return only an unpublished, disjoint suffix.
+    fn return_decode_arena(&mut self, _arena: &'de mut [u8]) {
+        unreachable!("ordinary readers have no decode arena")
+    }
+
+    fn error_at(&self, code: ErrorCode, index: usize) -> Error {
+        if self.borrowed_decode() {
+            let error = Error::without_context(code, self.origin_input(), index);
+            self.record_borrowed_error(BorrowedError::parser(&error));
+            error
+        } else {
+            Error::syntax(code, self.origin_input(), index)
+        }
+    }
+
     fn remain(&self) -> usize;
     fn eat(&mut self, n: usize);
     fn backward(&mut self, n: usize);
@@ -154,9 +185,18 @@ pub struct Read<'a> {
     pub(crate) index: usize,
     // next invalid utf8 position, if not found, will be usize::MAX
     next_invalid_utf8: usize,
+    borrowed_decode: bool,
+    decode_arena: Option<&'a mut [u8]>,
+    borrowed_error: OnceLock<BorrowedError>,
 }
 
 impl<'a> Read<'a> {
+    pub(crate) fn borrowed(input: &'a [u8], arena: &'a mut [u8]) -> Self {
+        let mut read = Self::new(input, true);
+        read.borrowed_decode = true;
+        read.decode_arena = Some(arena);
+        read
+    }
     /// Make a `Read` from string/bytes-like JSON input.
     pub fn from<I: JsonInput<'a>>(input: I) -> Self {
         let need = input.need_utf8_valid();
@@ -186,6 +226,9 @@ impl<'a> Read<'a> {
             input,
             index: 0,
             next_invalid_utf8,
+            borrowed_decode: false,
+            decode_arena: None,
+            borrowed_error: OnceLock::new(),
         }
     }
 
@@ -196,6 +239,24 @@ impl<'a> Read<'a> {
 }
 
 impl<'a> Reader<'a> for Read<'a> {
+    fn borrowed_decode(&self) -> bool {
+        self.borrowed_decode
+    }
+    fn borrowed_error(&self) -> Option<BorrowedError> {
+        self.borrowed_error.get().copied()
+    }
+    fn record_borrowed_error(&self, error: BorrowedError) {
+        let _ = self.borrowed_error.set(error);
+    }
+
+    fn take_decode_arena(&mut self) -> Option<&'a mut [u8]> {
+        self.decode_arena.take()
+    }
+
+    fn return_decode_arena(&mut self, arena: &'a mut [u8]) {
+        self.decode_arena = Some(arena);
+    }
+
     #[inline(always)]
     fn remain(&self) -> usize {
         self.slice().len() - self.index
@@ -283,11 +344,7 @@ impl<'a> Reader<'a> for Read<'a> {
         if self.next_invalid_utf8 == usize::MAX {
             Ok(())
         } else {
-            Err(Error::syntax(
-                ErrorCode::InvalidUTF8,
-                self.origin_input(),
-                self.next_invalid_utf8,
-            ))
+            Err(self.error_at(ErrorCode::InvalidUTF8, self.next_invalid_utf8))
         }
     }
 

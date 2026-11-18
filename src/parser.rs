@@ -305,7 +305,7 @@ where
             reason = EofWhileParsing;
             index = len;
         }
-        Error::syntax(reason, self.read.origin_input(), index)
+        self.read.error_at(reason, index)
     }
 
     // maybe error in generated in visitor, so we need fix the position.
@@ -357,11 +357,17 @@ where
     /// Parse a JSON string and visit it.
     /// When `strbuf` is Some, copies into the buffer (owned, calls visit_str).
     /// When `strbuf` is None, parses inplace zero-copy (calls visit_borrowed_str).
-    #[inline(always)]
+    // Keep scalar/SIMD scratch frames out of recursive DOM frames in debug builds.
+    #[cfg_attr(debug_assertions, inline(never))]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn parse_string_visit<V>(&mut self, vis: &mut V, strbuf: Option<&mut Vec<u8>>) -> Result<()>
     where
         V: JsonVisitor<'de>,
     {
+        if self.read.borrowed_decode() {
+            let value = self.parse_borrowed_str()?;
+            return check_visit!(self, vis.visit_borrowed_str(value));
+        }
         if let Some(strbuf) = strbuf {
             let rs = self.parse_str(strbuf)?;
             check_visit!(self, vis.visit_str(rs.as_ref()))
@@ -388,7 +394,8 @@ where
     /// Only called when strbuf=None (padded reader path). PaddedSliceRead has 64 bytes
     /// of zero-padding beyond valid JSON, so scanning 24 bytes ahead is always safe.
     /// Padding bytes (0x00) are < 0x20 and will bail to parse_string_visit.
-    #[inline(always)]
+    #[cfg_attr(debug_assertions, inline(never))]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn parse_key_scalar<V>(&mut self, vis: &mut V) -> Result<()>
     where
         V: JsonVisitor<'de>,
@@ -415,7 +422,8 @@ where
     }
 
     /// Parse a number. When `inplace` is true, visits as borrowed raw number.
-    #[inline(always)]
+    #[cfg_attr(debug_assertions, inline(never))]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn parse_number_visit<V>(&mut self, first: u8, vis: &mut V, inplace: bool) -> Result<()>
     where
         V: JsonVisitor<'de>,
@@ -561,7 +569,11 @@ where
     /// Dispatch value parsing based on the peeked byte.
     /// When `strbuf` is None, strings are parsed inplace (zero-copy borrowed).
     /// When `strbuf` is Some, strings are parsed into the buffer (owned copy).
-    #[inline(always)]
+    // This frame stays live while a child container is parsed. Separating only this
+    // dispatcher is insufficient: its scalar helpers must also stay out of line in
+    // debug builds so their scratch space is not retained at every nesting level.
+    #[cfg_attr(debug_assertions, inline(never))]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn dispatch_value<V>(
         &mut self,
         ch: Option<u8>,
@@ -833,6 +845,65 @@ where
         }
     }
 
+    /// Decode into a disjoint caller-owned region. The reader is immediately after a quote.
+    /// Scanning shares the checked string grammar; only escaped strings consume arena space.
+    pub(crate) fn parse_borrowed_str(&mut self) -> Result<&'de str> {
+        let start = self.read.index();
+        let status = self.skip_string()?;
+        self.check_invalid_utf8(false)?;
+        let end = self.read.index() - 1;
+        if status != ParseStatus::HasEscaped {
+            return std::str::from_utf8(&self.read.as_u8_slice()[start..end])
+                .map_err(|_| self.error(InvalidUTF8));
+        }
+        let arena = self
+            .read
+            .take_decode_arena()
+            .ok_or_else(|| self.error(UnexpectedVisitType))?;
+        let extent = end - start;
+        if arena.len() < extent {
+            self.read.return_decode_arena(arena);
+            return Err(self.error(UnexpectedVisitType));
+        }
+        let (output, remaining) = arena.split_at_mut(extent);
+        self.read.return_decode_arena(remaining);
+        self.read.set_index(start);
+        let mut written = 0;
+        while self.read.index() < end {
+            let byte = self
+                .read
+                .next()
+                .ok_or_else(|| self.error(EofWhileParsing))?;
+            if byte == b'\\' {
+                let escaped = self
+                    .read
+                    .next()
+                    .ok_or_else(|| self.error(EofWhileParsing))?;
+                if escaped == b'u' {
+                    let point = self.parse_escaped_utf8()?;
+                    let ch =
+                        char::from_u32(point).ok_or_else(|| self.error(InvalidUnicodeCodePoint))?;
+                    let mut encoded = [0; 4];
+                    let bytes = ch.encode_utf8(&mut encoded).as_bytes();
+                    output[written..written + bytes.len()].copy_from_slice(bytes);
+                    written += bytes.len();
+                } else {
+                    let decoded = ESCAPED_TAB[escaped as usize];
+                    if decoded == 0 {
+                        return Err(self.error(InvalidEscape));
+                    }
+                    output[written] = decoded;
+                    written += 1;
+                }
+            } else {
+                output[written] = byte;
+                written += 1;
+            }
+        }
+        self.read.set_index(end + 1);
+        std::str::from_utf8(&output[..written]).map_err(|_| self.error(InvalidUTF8))
+    }
+
     pub(crate) fn check_invalid_utf8(&mut self, allowed: bool) -> Result<bool> {
         // the invalid UTF-8 before the string, must have been checked before.
         let invalid = self.read.next_invalid_utf8();
@@ -841,11 +912,7 @@ where
         }
 
         if !allowed {
-            Err(Error::syntax(
-                ErrorCode::InvalidUTF8,
-                self.read.origin_input(),
-                invalid,
-            ))
+            Err(self.read.error_at(ErrorCode::InvalidUTF8, invalid))
         } else {
             // this space is allowed, should update the next invalid utf8 position
             self.read.check_invalid_utf8();
@@ -1162,6 +1229,14 @@ where
     }
 
     fn skip_escaped_chars(&mut self) -> Result<()> {
+        if self.read.borrowed_decode() && self.read.peek() == Some(b'u') {
+            self.read.eat(1);
+            let point = self.parse_escaped_utf8()?;
+            if char::from_u32(point).is_none() {
+                return Err(self.error(InvalidUnicodeCodePoint));
+            }
+            return Ok(());
+        }
         match self.read.peek() {
             Some(b'u') => {
                 if self.read.remain() < 6 {
@@ -2079,6 +2154,14 @@ where
 
     #[cold]
     pub fn peek_invalid_type(&mut self, peek: u8, exp: &dyn Expected) -> Error {
+        if self.read.borrowed_decode() {
+            // Validate the unexpected token without decoding it into the ordinary local Vec.
+            self.read.backward(1);
+            return match self.skip_one(true) {
+                Ok(_) => self.error(UnexpectedVisitType),
+                Err(error) => error,
+            };
+        }
         let err = match peek {
             b'n' => {
                 if let Err(err) = self.parse_literal("ull") {

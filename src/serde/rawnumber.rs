@@ -50,6 +50,21 @@ impl RawNumber {
 
 pub(crate) const TOKEN: &str = "$sonic_rs::private::JsonNumber";
 
+/// The one number token, as a static: its address is what makes a map key "sonic-rs's own".
+///
+/// `deserialize_any` (with `use_rawnumber`) hands a number as a one-entry map whose key is this
+/// very string, borrowed. [`is_number_token`] tells it from any other string with the same
+/// spelling, such as a key read from a document or YAML, which is an owned string or a span of
+/// its own input.
+#[cfg(feature = "arbitrary_precision")]
+pub static NUMBER_TOKEN: &str = "$sonic_rs::private::JsonNumber";
+
+/// Whether `s` is [`NUMBER_TOKEN`] itself (same data pointer and length), not merely equal text.
+#[cfg(feature = "arbitrary_precision")]
+pub fn is_number_token(s: &str) -> bool {
+    std::ptr::eq(s.as_ptr(), NUMBER_TOKEN.as_ptr()) && s.len() == NUMBER_TOKEN.len()
+}
+
 impl<'de> Deserialize<'de> for RawNumber {
     #[inline]
     fn deserialize<D>(deserializer: D) -> Result<RawNumber, D::Error>

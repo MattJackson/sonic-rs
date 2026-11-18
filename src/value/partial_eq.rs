@@ -15,6 +15,13 @@ impl PartialEq for Value {
         match self.as_ref2() {
             ValueRefInner::Null => other.is_null(),
             ValueRefInner::Bool(a) => other.as_bool() == Some(a),
+            // with `arbitrary_precision`, numbers are equal when their text is: a raw number by its
+            // lexeme, a built number by its `Display` (as `serde_json`'s `Number ==` does)
+            #[cfg(feature = "arbitrary_precision")]
+            ValueRefInner::Number(_) | ValueRefInner::RawNum(_) => {
+                number_text(self) == number_text(other)
+            }
+            #[cfg(not(feature = "arbitrary_precision"))]
             ValueRefInner::Number(_) | ValueRefInner::RawNum(_) => {
                 other.as_number() == self.as_number()
             }
@@ -26,6 +33,16 @@ impl PartialEq for Value {
             | ValueRefInner::EmptyObject
             | ValueRefInner::ObjectOwned(_) => other.as_object() == self.as_object(),
         }
+    }
+}
+
+/// The text a number is compared by (`v` is a number).
+#[cfg(feature = "arbitrary_precision")]
+fn number_text(v: &Value) -> std::borrow::Cow<'_, str> {
+    match v.as_ref2() {
+        ValueRefInner::RawNum(raw) => std::borrow::Cow::Borrowed(raw),
+        ValueRefInner::Number(n) => std::borrow::Cow::Owned(n.to_string()),
+        _ => std::borrow::Cow::Borrowed(""),
     }
 }
 

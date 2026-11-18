@@ -30,6 +30,26 @@ pub struct Error {
 pub type Result<T> = result::Result<T, Error>;
 
 impl Error {
+    pub(crate) fn borrowed_native_refusal(&self) -> bool {
+        matches!(
+            &self.err.code,
+            ErrorCode::Message(Cow::Borrowed("unsupported native JSON type"))
+        )
+    }
+    /// A parser error with position only. Never formats or copies document bytes.
+    pub(crate) fn without_context(code: ErrorCode, input: &[u8], index: usize) -> Self {
+        let position = Position::from_index(index, input);
+        Self {
+            err: Box::new(ErrorImpl {
+                code,
+                index,
+                line: position.line,
+                column: position.column,
+                descript: None,
+            }),
+        }
+    }
+
     /// One-based line number at which the error was detected.
     ///
     /// Characters in the first line of the input (before the first newline

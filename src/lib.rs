@@ -43,11 +43,18 @@ pub use crate::pointer::{JsonPointer, PointerNode, PointerTree};
 #[doc(inline)]
 pub use crate::serde::de::{MapAccess, SeqAccess};
 #[doc(inline)]
+pub use crate::serde::from_slice_borrowed_native;
+#[doc(inline)]
 pub use crate::serde::{
     from_reader, from_slice, from_slice_unchecked, from_str, to_lazyvalue, to_string,
-    to_string_pretty, to_vec, to_vec_pretty, to_writer, to_writer_pretty, Deserializer,
-    JsonNumberTrait, Number, RawNumber, Serializer, StreamDeserializer,
+    to_string_pretty, to_vec, to_vec_pretty, to_writer, to_writer_io, to_writer_pretty,
+    Deserializer, JsonNumberTrait, Number, RawNumber, Serializer, StreamDeserializer,
 };
+#[doc(inline)]
+pub use crate::serde::{from_slice_borrowed, BorrowedError, BorrowedRaw};
+#[cfg(feature = "arbitrary_precision")]
+#[doc(inline)]
+pub use crate::serde::{is_number_token, NUMBER_TOKEN};
 #[doc(inline)]
 pub use crate::value::{
     from_value, get::get_by_schema, to_value, Array, JsonContainerTrait, JsonType,

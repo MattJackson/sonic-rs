@@ -1,11 +1,19 @@
 //! Serde between JSON text and Rust data structure.
 
+pub(crate) mod borrowed;
+pub(crate) mod borrowed_native;
+pub(crate) mod borrowed_raw;
 pub(crate) mod de;
+pub use borrowed::{from_slice_borrowed, BorrowedError};
+pub use borrowed_native::from_slice_borrowed_native;
+pub use borrowed_raw::BorrowedRaw;
 pub(crate) mod number;
 pub(crate) mod rawnumber;
 pub(crate) mod ser;
 
 pub(crate) use self::de::tri;
+#[cfg(feature = "arbitrary_precision")]
+pub use self::rawnumber::{is_number_token, NUMBER_TOKEN};
 pub use self::{
     de::{
         from_reader, from_slice, from_slice_unchecked, from_str, Deserializer, StreamDeserializer,
@@ -13,7 +21,7 @@ pub use self::{
     number::{JsonNumberTrait, Number},
     rawnumber::RawNumber,
     ser::{
-        to_lazyvalue, to_string, to_string_pretty, to_vec, to_vec_pretty, to_writer,
+        to_lazyvalue, to_string, to_string_pretty, to_vec, to_vec_pretty, to_writer, to_writer_io,
         to_writer_pretty, Serializer,
     },
 };
